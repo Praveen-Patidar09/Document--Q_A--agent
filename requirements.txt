@@ -1,0 +1,12 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.9
+google-genai>=1.0,<2
+pinecone>=10,<11
+pypdf>=5,<7
+python-dotenv>=1,<2
+python-docx>=1.1,<2
+python-pptx>=1.0,<2
+openpyxl>=3.1,<4
+beautifulsoup4>=4.12,<5
+httpx>=0.28,<1
