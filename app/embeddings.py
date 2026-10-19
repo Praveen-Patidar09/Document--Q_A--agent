@@ -3,7 +3,7 @@
 import logging
 import random
 import time
-
+import re
 import httpx
 
 from app.config import settings
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 RETRYABLE_CODES = {408, 429, 500, 502, 503, 504}
 
 
-def _retry(call, attempts: int = 3):
+def _retry(call, attempts: int = 6):
     from google.genai import errors
 
     for attempt in range(attempts):
@@ -25,9 +25,9 @@ def _retry(call, attempts: int = 3):
             if not retryable or attempt + 1 == attempts:
                 raise
             delay = min(8.0, (2 ** attempt) * random.uniform(0.8, 1.2))
-            logger.warning("Gemini embedding transient failure; retry %s/%s in %.1fs",
-                           attempt + 1, attempts - 1, delay)
-            time.sleep(delay)
+            if isinstance(exc, errors.APIError) and exc.code == 429:
+                m = re.search(r"retry in ([\d.]+)s", str(exc))
+                delay = (float(m.group(1)) if m else 20.0) + 1.0
 
 
 class GeminiEmbeddings:
@@ -60,8 +60,11 @@ class GeminiEmbeddings:
 
     def documents(self, texts: list[str]) -> list[list[float]]:
         vectors = []
-        for offset in range(0, len(texts), 64):
-            vectors.extend(self._embed(texts[offset:offset + 64], "RETRIEVAL_DOCUMENT"))
+        batch = 25                     # pehle 64 tha
+        for offset in range(0, len(texts), batch):
+            if offset:
+                time.sleep(17)         # 25 chunks / 17s = ~88 per minute, limit 100 ke neeche
+            vectors.extend(self._embed(texts[offset:offset + batch], "RETRIEVAL_DOCUMENT"))
         return vectors
 
     def query(self, text: str) -> list[float]:

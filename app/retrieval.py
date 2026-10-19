@@ -1,106 +1,78 @@
-"""Question-aware ranking over a Pinecone candidate set."""
+"""Question-aware ranking over a Pinecone candidate set.
 
-import math
+Pinecone returns the semantically closest chunks. Here they are re-ranked with a small bonus
+for exact question terms, then turned into the labelled excerpts shown to the model.
+Nothing in this file depends on the document type or topic.
+"""
+
 import re
 import unicodedata
 
 from app.config import settings
 from app.models import Candidate, Chunk
 
+# How much exact term overlap can add to the semantic score (overlap is 0..1).
+LEXICAL_WEIGHT = 0.12
+
 _TOKEN = re.compile(r"[a-z0-9]+|[\u0900-\u097f]+", re.IGNORECASE)
+# Function words only (English plus common Hinglish question words); no topic words.
 _STOP = set("""a an the and or but is are was were be been being do does did have has had
 how what when where which who whom why many much tell me about of in on at to for from with
 by as it this that these those my your their his her its i we they he she you please give find
-hai hain tha thi the kya kab kahan kitna kitne kitni ka ki ke mein me par se ko aur batao bata
-mera meri mere us uska uski uske unka unki hain hai tha thi""".split())
+hai hain tha thi kya kab kahan kitna kitne kitni ka ki ke mein me par se ko aur batao bata
+mera meri mere us uska uski uske unka unki""".split())
 
 
 def terms(text: str) -> list[str]:
+    """Lower-cased content words of `text`, without stop words and with a trailing plural 's' cut."""
     words = [unicodedata.normalize("NFKC", item).casefold() for item in _TOKEN.findall(text)]
     return [word[:-1] if len(word) > 4 and word.endswith("s") else word
             for word in words if word not in _STOP and (len(word) > 1 or word.isdigit())]
 
 
 def lexical_match(question: str, text: str) -> float:
+    """Share (0..1) of the question's content words that also appear in `text`."""
     query_terms = set(terms(question))
     if not query_terms:
         return 0.0
-    body_terms = set(terms(text))
-    exact = len(query_terms & body_terms)
-    # Keep lexical contribution bounded; semantic similarity remains the first-stage gate.
-    return exact / len(query_terms)
+    return len(query_terms & set(terms(text))) / len(query_terms)
 
 
 def rank_candidates(question: str, rows: list[tuple[Chunk, float]], limit: int | None = None,
-                     min_similarity: float | None = None) -> list[Candidate]:
+                    min_similarity: float | None = None) -> list[Candidate]:
+    """Drop weak semantic matches, then order the rest by similarity plus an exact-term bonus."""
     floor = settings.min_similarity if min_similarity is None else min_similarity
     ranked = []
     for chunk, raw_score in rows:
         score = float(raw_score or 0.0)
         if score < floor:
             continue
+        # Exact wording breaks ties between passages that are semantically close.
         lexical = lexical_match(question, chunk.text)
-        # Exact query terminology, especially names/count labels, breaks ties between semantically
-        # similar passages such as a connection count and a follower count.
-        combined = score + 0.12 * lexical
-        ranked.append(Candidate(chunk, score, lexical, combined))
+        ranked.append(Candidate(chunk, score, lexical, score + LEXICAL_WEIGHT * lexical))
     ranked.sort(key=lambda item: (item.rank_score, item.lexical_score, item.similarity), reverse=True)
-    if limit is None:
-        limit = settings.context_k
-    return ranked[:limit]
+    return ranked[:settings.context_k if limit is None else limit]
 
 
-def _focused_source_text(question: str, candidates: list[Candidate]) -> list[tuple[Candidate, str]]:
-    question_folded = unicodedata.normalize("NFKC", question).casefold()
-    employment_question = bool(re.search(
-        r"\b(work|working|employer|employment|job|position|role|experience)\b|काम|नौकरी|kaam|naukri",
-        question_folded))
-    skills_question = bool(re.search(r"\b(skill|skills|technical|technology|technologies)\b|कौशल|skills?",
-                                     question_folded))
-    focused: list[tuple[Candidate, str]] = []
-    if employment_question:
-        for item in candidates:
-            for match in re.finditer(r"\bEXPERIENCE\b\s*([^\x7f]{1,350})", item.chunk.text):
-                excerpt = " ".join(match.group(1).split()).strip(" :-|\n")
-                if "|" in excerpt and re.search(r"\b(?:19|20)\d{2}\b|present|current", excerpt, re.I):
-                    focused.append((item, excerpt))
-        current = [row for row in focused if re.search(r"\bpresent\b|\bcurrent\b", row[1], re.I)]
-        if current and not re.search(r"\b(all|every|previous|past|history)\b", question_folded):
-            return current[:2]
-        if focused:
-            return focused[:4]
-    if skills_question:
-        for item in candidates:
-            match = re.search(
-                r"\bTECHNICAL SKILLS\b\s*(.*?)(?=\bEXPERIENCE\b|\bPROJECTS\b|\bEDUCATION\b|$)",
-                item.chunk.text, re.DOTALL)
-            if match:
-                excerpt = " ".join(match.group(1).split()).strip(" :-|\n")
-                if excerpt:
-                    focused.append((item, excerpt))
-        if focused:
-            return focused[:2]
-    return []
+def _source_label(metadata: dict) -> str:
+    name = str(metadata.get("filename") or metadata.get("source") or "Document")
+    places = [f"{label} {metadata[key]}" for key, label in
+              (("page", "page"), ("slide", "slide"), ("sheet", "sheet")) if metadata.get(key)]
+    return f"{name} ({', '.join(places)})" if places else name
 
 
 def prepare_context(candidates: list[Candidate], question: str | None = None) -> str:
-    focused = _focused_source_text(question, candidates) if question else []
-    source_rows = focused or [(item, item.chunk.text) for item in candidates]
-    excerpts = []
-    seen = set()
-    for number, (item, source_text) in enumerate(source_rows, 1):
-        text = " ".join(source_text.split())
+    """Join the ranked chunks into numbered, source-labelled excerpts, skipping duplicates.
+
+    `question` is accepted so existing callers keep working; the context does not depend on it.
+    """
+    excerpts: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        text = " ".join(item.chunk.text.split())
         key = re.sub(r"\W+", " ", text.casefold()).strip()
         if not text or key in seen:
             continue
         seen.add(key)
-        meta = item.chunk.metadata
-        locators = []
-        for key_name, label in (("page", "page"), ("slide", "slide"), ("sheet", "sheet")):
-            if meta.get(key_name):
-                locators.append(f"{label} {meta[key_name]}")
-        location = ", ".join(locators)
-        name = str(meta.get("filename") or meta.get("source") or "Document")
-        label = f"{name} ({location})" if location else name
-        excerpts.append(f"[E{number} | {label}]\n{text}")
+        excerpts.append(f"[E{len(excerpts) + 1} | {_source_label(item.chunk.metadata)}]\n{text}")
     return "\n\n".join(excerpts)

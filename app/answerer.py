@@ -1,4 +1,17 @@
-"""Single-call Ollama answer generation with exact evidence-quote validation."""
+"""Ollama answer generation plus structural validation of the model's reply.
+
+The validator only checks things that can be verified without understanding language:
+
+  1. the reply has the expected JSON shape,
+  2. every evidence quote really comes from the retrieved excerpts,
+  3. every number in the answer appears in those quotes,
+  4. a person's name and a number stay together in one quote,
+  5. the answer is English (Devanagari / Hinglish falls back to the verbatim quote).
+
+There are no word lists and no topic-specific rules, so it behaves the same for any
+document. Checks that need real language understanding (synonyms, paraphrase, label swaps)
+are deliberately NOT done here with word matching; they belong in a meaning-based check.
+"""
 
 import json
 import logging
@@ -11,8 +24,10 @@ import urllib.request
 from app.config import settings
 from app.diagnostics import trace
 from app.prompts import SYSTEM_PROMPT, user_prompt
+from app.retrieval import terms
 
 logger = logging.getLogger(__name__)
+
 NOT_FOUND = "This information is not available in the selected document."
 OUTPUT_SCHEMA = {
     "type": "object",
@@ -20,38 +35,26 @@ OUTPUT_SCHEMA = {
     "required": ["answer", "evidence"],
     "additionalProperties": False,
 }
+
 _NUMBER = re.compile(r"(?<!\w)(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?(?!\w)")
-_HINDI = re.compile(r"[\u0900-\u097f]")
+_HINDI = re.compile(r"[ऀ-ॿ]")
+_WORD = re.compile(r"\w+")
 _REFUSAL = re.compile(re.escape(NOT_FOUND), re.IGNORECASE)
-_TITLE_WORD = re.compile(r"\b[A-Z][a-z]{1,}\b|\b[A-Z]{2,}\b")
-_NON_ENTITY = {"The", "This", "That", "These", "Those", "There", "It", "Its", "In", "On", "At",
-               "For", "From", "By", "With", "A", "An", "And", "But", "The", "Document"}
-_NON_ENTITY |= {"Technical"}
-_METRICS = {"connection", "follower", "view", "like", "member", "user", "employee", "revenue",
-            "fee", "price", "cost", "salary", "score", "point", "download", "subscriber", "visit",
-            "impression", "click", "percent", "percentage", "year", "month", "day", "week", "hour"}
-_ANSWER_GLUE = {"the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "be", "been",
-                "being", "has", "have", "had", "do", "does", "did", "of", "on", "in", "at", "to",
-                "for", "from", "with", "by", "as", "it", "this", "that", "these", "those", "there",
-                "not", "only", "part", "also", "its", "their", "his", "her", "your", "my", "we", "they",
-                "you", "he", "she", "what", "which", "who", "when", "where", "how", "many", "much",
-                "like",
-                "skill", "technical",
-                "profile", "document", "name", "called", "lists", "list", "listed", "shows", "show", "states",
-                "state", "reports", "reported", "provides", "provided", "indicates", "indicated", "says", "said",
-                "mentions", "mentioned", "specify", "specified", "specifies", "does", "missing", "available",
-                "information", "selected", "page", "one", "there", "on", "the", "based", "begins", "began", "starts", "started",
-                "count", "date", "creation", "renewal", "exist", "exists", "existence"}
-# These words express ordinary grammatical paraphrases of job/date evidence. Material
-# claims (names, numbers, metrics, and descriptive qualifiers) still need source support.
-_SAFE_PARAPHRASE = {"currently", "current", "work", "works", "working", "employ", "employed",
-                    "employment", "position", "role", "start", "starting", "since", "present",
-                    "including", "include", "such", "expertise", "technology", "technologie",
-                    "programming", "development", "develop", "using", "use"}
+_PERSON_NAME = re.compile(r"\b([A-Z][a-z]{2,})\s+([A-Z][a-z]{2,})\b")
+# Latin-script Hindi words that signal the model ignored the English-only instruction.
 _HINGLISH_MARKERS = {"hai", "hain", "tha", "thi", "hoga", "hogi", "honge", "nahi", "nahin",
                      "kya", "kab", "kaise", "kitna", "kitni", "kitne", "kyunki", "mein", "se", "ko",
                      "par", "aur", "bhi", "wala", "wali", "wale", "mila", "milta", "milti"}
 
+_MAX_QUOTE_CHARS = 1200
+_MAX_FALLBACK_QUOTE_CHARS = 240
+_MIN_FUZZY_QUOTE_WORDS = 4   # shorter quotes must match exactly
+_FUZZY_WINDOW_FACTOR = 2     # matched words may spread over at most 2x the quote length (+4)
+_QUOTE_CHARS = "\"'“”‘’ \t\r\n"
+_TRIM_CHARS = " \t\r\n-–—;,"
+
+
+# --------------------------------------------------------------------------- text helpers
 
 def _normalize_for_match(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
@@ -62,50 +65,75 @@ def _unescape_output(text: str) -> str:
     return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", " ").strip()
 
 
-def _english_tokens(text: str) -> set[str]:
-    found = set(re.findall(r"[a-z]+", unicodedata.normalize("NFKC", text).casefold()))
-    stems = set()
-    for word in found:
-        if word in {"january", "february", "march", "april", "june", "july", "august",
-                    "september", "october", "november", "december"}:
-            stems.add(word[:3])
-        elif word.endswith("ies") and len(word) > 5:
-            stems.add(word[:-3] + "y")
-        elif word in {"working", "worked", "works"}:
-            stems.add("work")
-        elif word in {"scored", "scores", "scoring"}:
-            stems.add("score")
-        elif word in {"started", "starts", "starting"}:
-            stems.add("start")
-        elif word in {"began", "begins", "beginning"}:
-            stems.add("begin")
-        elif len(word) > 4 and word.endswith("s") and not word.endswith(("ss", "us", "is", "as")):
-            stems.add(word[:-1])
-        else:
-            stems.add(word)
-    return stems
+def _strip_wrapping_quotes(text: str) -> str:
+    """Models often wrap a quote in their own quotation marks; those are not document text."""
+    return text.strip(_QUOTE_CHARS)
 
 
-def _capitalized_entities(text: str) -> set[str]:
-    return _english_tokens(" ".join(word for word in _TITLE_WORD.findall(text)
-                                    if word not in _NON_ENTITY))
+def _numbers(text: str) -> set[str]:
+    return {number.replace(",", "") for number in _NUMBER.findall(text)}
 
 
-def _capitalized_name_phrases(text: str) -> set[str]:
-    return {" ".join(match).casefold() for match in re.findall(
-        r"\b([A-Z][a-z]{2,})\s+([A-Z][a-z]{2,})\b", text)}
+def _name_pairs(text: str) -> set[str]:
+    return {" ".join(match).casefold() for match in _PERSON_NAME.findall(text)}
 
 
-def _metrics_in(text: str) -> set[str]:
-    found = _english_tokens(text) & _METRICS
-    # "like" is also a frequent preposition ("tools like Git"). Count it as a metric
-    # only in count/label constructions, where it clearly means a social-media reaction.
-    if "like" in found and not re.search(
-            r"\b(?:likes?\s*(?:count|number|:|=)|number\s+of\s+likes?|\d[\d,]*\s+likes?)\b",
-            text, re.IGNORECASE):
-        found.remove("like")
-    return found
+def _word_tokens(text: str) -> list[tuple[str, int, int]]:
+    """(normalized word, start, end) for every word; offsets point into the original text."""
+    return [(unicodedata.normalize("NFKC", m.group()).casefold(), m.start(), m.end())
+            for m in _WORD.finditer(text)]
 
+
+# --------------------------------------------------------------------------- quote grounding
+
+def _span_in_block(quote_words: list[str], block: str) -> str | None:
+    """Return the verbatim text of `block` that contains the quote's words in order.
+
+    This tolerates a model shortening a quote (dropping words in the middle) while still
+    requiring every quoted word to exist, in order, close together, in the same excerpt.
+    """
+    words = _word_tokens(block)
+    window = len(quote_words) * _FUZZY_WINDOW_FACTOR + 4
+    for start, (word, first_char, _) in enumerate(words):
+        if word != quote_words[0]:
+            continue
+        matched, last = 1, start
+        for position in range(start + 1, min(len(words), start + window)):
+            if matched == len(quote_words):
+                break
+            if words[position][0] == quote_words[matched]:
+                matched += 1
+                last = position
+        if matched == len(quote_words):
+            return block[first_char:words[last][2]]
+    return None
+
+
+def _ground_quote(quote: str, normalized_context: str, blocks: list[str]) -> str | None:
+    """Return text that is verbatim from the context, or None if the quote is not supported."""
+    quote = _strip_wrapping_quotes(_unescape_output(quote))
+    if not quote or len(quote) > _MAX_QUOTE_CHARS:
+        return None
+    if _normalize_for_match(quote) in normalized_context:
+        return quote
+    quote_words = [word for word, _, _ in _word_tokens(quote)]
+    if len(quote_words) < _MIN_FUZZY_QUOTE_WORDS:
+        return None
+    for block in blocks:
+        span = _span_in_block(quote_words, block)
+        if span and len(span) <= _MAX_QUOTE_CHARS:
+            return span
+    return None
+
+
+def _grounded_quotes(evidence: list[str], context: str) -> list[str]:
+    normalized_context = _normalize_for_match(context)
+    blocks = [block for block in re.split(r"\n\s*\n", context) if block.strip()]
+    grounded = (_ground_quote(item, normalized_context, blocks) for item in evidence if item.strip())
+    return [quote for quote in grounded if quote]
+
+
+# --------------------------------------------------------------------------- validation
 
 def parse_json(raw: str) -> dict | None:
     if not isinstance(raw, str):
@@ -125,100 +153,68 @@ def parse_json(raw: str) -> dict | None:
     return value
 
 
+def _person_and_number_share_a_quote(answer: str, question: str, quotes: list[str]) -> bool:
+    """Stop a number for one person being given to a similarly named person."""
+    answer_numbers = _numbers(answer)
+    people = _name_pairs(answer) - _name_pairs(question)
+    if not (_name_pairs(question) and people and answer_numbers):
+        return True
+    return any(
+        all(person in _normalize_for_match(quote) for person in people)
+        and answer_numbers.issubset(_numbers(quote))
+        for quote in quotes
+    )
+
+
+def _is_not_english(answer: str) -> bool:
+    return bool(_HINDI.search(answer)
+                or set(re.findall(r"[a-z]+", answer.casefold())) & _HINGLISH_MARKERS)
+
+
 def validate_response(raw: str, question: str, context: str) -> str:
+    """Return a validated answer, or NOT_FOUND when the reply cannot be trusted."""
     result = parse_json(raw)
     if result is None:
         logger.warning("Ollama response was malformed or truncated; returning fixed abstention.")
         return NOT_FOUND
 
     answer = _unescape_output(result["answer"])
-    evidence = [_unescape_output(value) for value in result["evidence"] if value.strip()]
     if _REFUSAL.fullmatch(answer):
         return NOT_FOUND
-    # Remove the exact contradictory refusal before validating the supported answer itself.
-    answer = _REFUSAL.sub("", answer).strip(" \t\r\n-–—;,")
-    if not answer or not evidence:
+    # Remove an exact contradictory refusal before validating the supported answer itself.
+    answer = _REFUSAL.sub("", answer).strip(_TRIM_CHARS)
+    if not answer or not any(item.strip() for item in result["evidence"]):
         return NOT_FOUND
 
-    normalized_context = _normalize_for_match(context)
-    valid_quotes = [quote for quote in evidence
-                    if len(quote) <= 1200 and _normalize_for_match(quote) in normalized_context]
-    if not valid_quotes:
+    quotes = _grounded_quotes(result["evidence"], context)
+    if not quotes:
         logger.warning("Ollama answer had no evidence quote matching retrieved text.")
         return NOT_FOUND
 
-    # A document quote is necessary but not sufficient: ensure every number asserted is in the
-    # supporting quote(s). This prevents swapping a nearby follower count for a connection count.
-    evidence_text = "\n".join(valid_quotes)
-    evidence_numbers = {number.replace(",", "") for number in _NUMBER.findall(evidence_text)}
-    answer_numbers = {number.replace(",", "") for number in _NUMBER.findall(answer)}
-    if not answer_numbers.issubset(evidence_numbers):
+    # A real quote is necessary but not sufficient: every number asserted must be in the quotes.
+    if not _numbers(answer).issubset(_numbers("\n".join(quotes))):
         logger.warning("Ollama answer introduced a number absent from its evidence quotes.")
         return NOT_FOUND
 
-    evidence_tokens = _english_tokens(evidence_text)
-    answer_tokens = _english_tokens(answer)
-    question_tokens = _english_tokens(question)
-    requested_metrics = question_tokens & _METRICS
-    if not requested_metrics.issubset(evidence_tokens):
-        logger.warning("Retrieved evidence does not mention the metric asked about.")
-        return NOT_FOUND
-    answer_metrics = _metrics_in(answer)
-    evidence_metrics = _metrics_in(evidence_text)
-    if not answer_metrics.issubset(evidence_metrics):
-        logger.warning("Answer changed the metric label; answer=%s evidence=%s.",
-                       sorted(answer_metrics), sorted(evidence_metrics))
+    if not _person_and_number_share_a_quote(answer, question, quotes):
+        logger.warning("Answer combined a different person's name with the requested number.")
         return NOT_FOUND
 
-    # Names and technical terms can be in any of the supplied excerpts, even when the
-    # model's short quote omits them. Keep them grounded in the selected context.
-    answer_entities = _capitalized_entities(answer)
-    context_tokens = _english_tokens(context)
-    question_entities = _capitalized_entities(question)
-    if not (answer_entities - question_entities).issubset(context_tokens):
-        logger.warning("Answer introduced names absent from evidence quotes: %s.",
-                       sorted((answer_entities - question_entities) - context_tokens))
-        return NOT_FOUND
-
-    # Keep a person's name and a requested number together in one exact quote. This
-    # stops a score/count for one person being assigned to a similar nearby person.
-    question_people = _capitalized_name_phrases(question)
-    answer_people = _capitalized_name_phrases(answer) - question_people
-    if question_people and answer_people and answer_numbers:
-        associated = any(
-            all(_normalize_for_match(person) in _normalize_for_match(quote) for person in answer_people)
-            and answer_numbers.issubset({number.replace(",", "") for number in _NUMBER.findall(quote)})
-            for quote in valid_quotes
-        )
-        if not associated:
-            logger.warning("Answer combined a different person's name with the requested number.")
-            return NOT_FOUND
-
-    # The requested output language is English. If the model ignores this, fail closed instead of
-    # returning non-English prose that the frontend cannot distinguish from a grounded answer.
-    if _HINDI.search(answer) or _english_tokens(answer) & _HINGLISH_MARKERS:
+    # English is required. If the model ignored that, a short verbatim English quote is safer
+    # than refusing a fact only because the model answered in Hindi.
+    if _is_not_english(answer):
         logger.warning("Ollama ignored the English-only answer requirement.")
-        # The evidence field is an exact quote selected by the model and already checked
-        # against the selected document. Returning a short English source quote is safer
-        # than refusing a fact solely because the model answered in Hindi.
-        if valid_quotes:
-            quote = min(valid_quotes, key=len)
-            if len(quote) <= 240 and not _HINDI.search(quote):
-                return quote
+        quote = min(quotes, key=len)
+        if len(quote) <= _MAX_FALLBACK_QUOTE_CHARS and not _HINDI.search(quote):
+            return quote
         return NOT_FOUND
 
-    unsupported_terms = (_english_tokens(answer) - context_tokens - _ANSWER_GLUE
-                         - _SAFE_PARAPHRASE - question_entities)
-    if unsupported_terms:
-        logger.warning("Answer contains terms not supported by the quoted evidence: %s",
-                       ", ".join(sorted(unsupported_terms)))
-        return NOT_FOUND
-
-    # Normalize only the exact refusal already removed above and nearby separators.
     answer = re.sub(r"[ \t]{2,}", " ", answer)
-    answer = re.sub(r"\n{3,}", "\n\n", answer).strip(" \t\r\n-–—;,")
+    answer = re.sub(r"\n{3,}", "\n\n", answer).strip(_TRIM_CHARS)
     return answer or NOT_FOUND
 
+
+# --------------------------------------------------------------------------- Ollama client
 
 class OllamaAnswerer:
     def __init__(self):
@@ -240,9 +236,9 @@ class OllamaAnswerer:
 
     @staticmethod
     def _needs_recheck(question: str, context: str) -> bool:
+        """After a bare refusal, retry once if the question clearly overlaps the excerpts."""
         conjunction = re.search(r"\b(and|or|also|aur|bhi)\b|और|तथा", question, re.IGNORECASE)
-        question_terms = _english_tokens(question) - _ANSWER_GLUE - _HINGLISH_MARKERS
-        overlap = question_terms & _english_tokens(context)
+        overlap = set(terms(question)) & set(terms(context))
         return len(overlap) >= 2 or (bool(conjunction) and bool(overlap))
 
     def _generate(self, question: str, context: str, retry_partial: bool = False) -> tuple[str, str | None]:
